@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Arena — HTML Multiplayer (PeerJS)</title>
+<script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+<style>
+  :root{--bg:#0b1020;--panel:#0f1724;--accent:#6ee7b7;--muted:#94a3b8}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#071026 0%, #0b1220 100%);color:#e6eef6}
+  .wrap{max-width:1100px;margin:20px auto;padding:20px}
+  header{display:flex;gap:12px;align-items:center}
+  h1{margin:0;font-size:20px}
+  .controls{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .panel{background:rgba(255,255,255,0.03);padding:12px;border-radius:10px;box-shadow:0 6px 24px rgba(2,6,23,0.6)}
+  button{background:var(--accent);border:none;padding:8px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+  input{background:transparent;border:1px solid rgba(255,255,255,0.08);padding:8px;border-radius:8px;color:inherit}
+  canvas{display:block;margin-top:14px;border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent)}
+  .muted{color:var(--muted);font-size:13px}
+  .small{font-size:13px}
+  .right{margin-left:auto}
+  .status{margin-top:10px;}
+  .log{max-height:120px;overflow:auto;padding:8px;background:rgba(0,0,0,0.15);border-radius:8px;font-family:monospace;font-size:13px}
+  footer{margin-top:18px;color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Mini Arena — HTML Multiplayer (PeerJS)</h1>
+    <div class="muted small right">Move: WASD / Arrow keys · Press Space to respawn</div>
+  </header>
+
+  <div class="controls panel">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label class="small muted">Your name</label>
+      <input id="nameInput" placeholder="player123" />
+      <button id="createBtn">Create Room (Host)</button>
+      <button id="joinBtn">Join Room</button>
+
+      <label class="small muted">Host ID (paste to join)</label>
+      <input id="hostIdInput" placeholder="host-peer-id" style="min-width:280px" />
+      <button id="copyIdBtn">Copy My ID</button>
+    </div>
+
+    <div class="status small muted" id="status">Status: Not connected</div>
+    <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap">
+      <div class="panel" style="flex:1;min-width:220px">
+        <div class="small muted">My Peer ID</div>
+        <div id="myPeerId" class="log">—</div>
+      </div>
+      <div class="panel" style="flex:2;min-width:260px">
+        <div class="small muted">Room / Connections</div>
+        <div id="connections" class="log">—</div>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="game" width="900" height="500"></canvas>
+
+  <footer>
+    <div class="muted small">How it works: One player creates a room and becomes the host. The host accepts connections and relays state updates (positions) to connected clients. Clients send inputs to host. This demo uses PeerJS (WebRTC data channels) and runs in-browser.</div>
+    <div class="muted small">If connections fail occasionally, try refreshing the page and recreating the room. For production, run your own PeerServer.</div>
+  </footer>
+</div>
+
+<script>
+/*
+Mini Arena Multiplayer using PeerJS (single-file).
+- Host creates a Peer and waits for incoming connections.
+- Joining peers connect to host by host's Peer ID.
+- Each peer sends input events to host (velocity), host updates authoritative positions and broadcasts 'state' periodically.
+- Simple interpolation on clients.
+
+Notes:
+- PeerJS uses a cloud broker by default. For heavy usage, host your own PeerServer.
+- This is intentionally small/simple for demo and learning.
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const nameInput = document.getElementById('nameInput');
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const hostIdInput = document.getElementById('hostIdInput');
+const myPeerIdDiv = document.getElementById('myPeerId');
+const statusDiv = document.getElementById('status');
+const connectionsDiv = document.getElementById('connections');
+const copyIdBtn = document.getElementById('copyIdBtn');
+
+let peer = null;
+let isHost = false;
+let hostId = null;
+let connections = {}; // peerId -> DataConnection (for host)
+let connToHost = null; // DataConnection (for clients)
+let myPeerId = null;
+
+const world = {
+  players: {} // peerId -> {name, x,y, vx,vy, color, lastUpdate}
+};
+
+const localPlayer = {
+  id: null,
+  name: '',
+  x: Math.random() * (canvas.width-80) + 40,
+  y: Math.random() * (canvas.height-80) + 40,
+  vx: 0, vy: 0,
+  color: null,
+  alive: true
+};
+
+const keys = {up:false,down:false,left:false,right:false};
+
+function rndColor(){
+  const hues = ['#6EE7B7','#FBCFE8','#93C5FD','#FDE68A','#FDBA74','#A78BFA','#FCA5A5','#60A5FA'];
+  return hues[Math.floor(Math.random()*hues.length)];
+}
+
+function logConnections(){
+  const lines = [];
+  for(const id in world.players){
+    const p = world.players[id];
+    lines.push(`${id.slice(0,6)}… : ${p.name} (${Math.round(p.x)},${Math.round(p.y)})`);
+  }
+  connectionsDiv.textContent = lines.join('\n') || '—';
+}
+
+function setStatus(t){ statusDiv.textContent = 'Status: ' + t; }
+
+function makePeer(){
+  // Using default PeerJS cloud broker. You can pass {host:'yourserver',port:...,path:'/peerjs'} to self-host.
+  peer = new Peer(); // PeerJS will allocate an ID
+  peer.on('open', id => {
+    myPeerId = id;
+    myPeerIdDiv.textContent = id;
+    setStatus('Ready (Peer created)');
+  });
+  peer.on('error', err => {
+    console.error('Peer error', err);
+    setStatus('Peer error: ' + (err.message || err));
+  });
+  peer.on('connection', c => {
+    // If we are host, accept connections
+    if(!isHost){
+      // non-host shouldn't receive connections
+      c.on('open', () => c.close());
+      return;
+    }
+    setupIncomingConnection(c);
+  });
+}
+
+function setupIncomingConnection(c){
+  const id = c.peer;
+  connections[id] = c;
+  console.log('Incoming connection from', id);
+  c.on('data', data => {
+    handleClientMessage(id, data);
+  });
+  c.on('close', () => {
+    console.log('Connection closed', id);
+    removePlayer(id);
+    delete connections[id];
+    broadcastFullState();
+  });
+  // On new connection, add player
+  c.on('open', () => {
+    // first expect a "hello" msg with name + initial color request
+    // if client doesn't send hello in short time, we'll still create a slot
+    world.players[id] = {
+      name: 'guest',
+      x: Math.random()*(canvas.width-80)+40,
+      y: Math.random()*(canvas.height-80)+40,
+      vx:0, vy:0,
+      color: rndColor(),
+      lastUpdate: Date.now()
+    };
+    broadcastFullState();
+  });
+}
+
+function removePlayer(id){
+  delete world.players[id];
+  logConnections();
+  setStatus('Player left: ' + id);
+}
+
+function handleClientMessage(id, data){
+  // Only host uses this path: receives inputs from clients
+  if(!isHost) return;
+  if(!world.players[id]) {
+    world.players[id] = {
+      name: data?.name || 'guest',
+      x: Math.random()*(canvas.width-80)+40,
+      y: Math.random()*(canvas.height-80)+40,
+      vx:0, vy:0,
+      color: data?.color || rndColor(),
+      lastUpdate: Date.now()
+    };
+  }
+  // data types: {type:'hello', name, color} or {type:'input', vx,vy, ts} or {type:'respawn'}
+  if(data.type === 'hello'){
+    world.players[id].name = data.name || world.players[id].name;
+    world.players[id].color = data.color || world.players[id].color;
+    setStatus('Player joined: ' + world.players[id].name);
+    broadcastFullState();
+  } else if(data.type === 'input'){
+    const p = world.players[id];
+    if(!p) return;
+    p.vx = data.vx;
+    p.vy = data.vy;
+    p.lastUpdate = Date.now();
+  } else if(data.type === 'respawn'){
+    const p = world.players[id];
+    if(!p) return;
+    p.x = Math.random()*(canvas.width-80)+40;
+    p.y = Math.random()*(canvas.height-80)+40;
+    p.vx = p.vy = 0;
+    broadcastFullState();
+  }
+}
+
+function broadcastFullState(){
+  // Host sends entire authoritative state to clients
+  const payload = {type:'state', players: world.players, ts: Date.now()};
+  for(const id in connections){
+    try { connections[id].send(payload); } catch(e){ console.warn('send failed', e); }
+  }
+  // Host also keeps its own state in world.players[hostId]
+  logConnections();
+}
+
+function connectToHost(hostPeerId){
+  if(!peer) makePeer();
+  setStatus('Connecting to host ' + hostPeerId);
+  connToHost = peer.connect(hostPeerId, {reliable:true});
+  connToHost.on('open', () => {
+    setStatus('Connected to host');
+    // send hello with name/color
+    localPlayer.name = nameInput.value || ('P-'+Math.random().toString(36).slice(2,7));
+    localPlayer.color = localPlayer.color || rndColor();
+    connToHost.send({type:'hello', name:localPlayer.name, color:localPlayer.color});
+    // create local placeholder
+    localPlayer.id = peer.id;
+    // request an immediate state maybe will arrive from host
+  });
+  connToHost.on('data', data => {
+    // client receives state updates from host
+    if(data.type === 'state'){
+      // replace local world.players copy with server authoritative state
+      // but preserve interpolation helper fields on client side
+      for(const id in data.players){
+        const p = data.players[id];
+        // copy into local world.players
+        if(!world.players[id]){
+          world.players[id] = {
+            name: p.name, x: p.x, y: p.y, vx:p.vx, vy:p.vy, color:p.color, lastUpdate: data.ts
+          };
+        } else {
+          // update smoothly: set target positions and velocities
+          world.players[id].name = p.name;
+          world.players[id].color = p.color;
+          world.players[id].vx = p.vx;
+          world.players[id].vy = p.vy;
+          // avoid snapping by setting x,y and storing lastUpdate
+          world.players[id].x = p.x;
+          world.players[id].y = p.y;
+          world.players[id].lastUpdate = data.ts;
+        }
+      }
+      // remove departed players that host doesn't include
+      for(const id in world.players){
+        if(!data.players[id]){
+          delete world.players[id];
+        }
+      }
+      logConnections();
+    }
+  });
+  connToHost.on('close', () => {
+    setStatus('Disconnected from host');
+    connToHost = null;
+  });
+  connToHost.on('error', err => {
+    console.error('Connection error', err);
+    setStatus('Connection error: ' + (err && err.message));
+  });
+}
+
+// Host game loop (authoritative physics)
+let lastTick = performance.now();
+function hostTick(now){
+  const dt = Math.min(0.06, (now - lastTick)/1000);
+  lastTick = now;
+  // update each player based on vx vy
+  for(const id in world.players){
+    const p = world.players[id];
+    p.x += (p.vx||0) * dt * 200;
+    p.y += (p.vy||0) * dt * 200;
+    // clamp
+    p.x = Math.max(16, Math.min(canvas.width-16, p.x));
+    p.y = Math.max(16, Math.min(canvas.height-16, p.y));
+  }
+  // broadcast at ~15Hz (every ~66ms)
+  if(now % 66 < 16){
+    broadcastFullState();
+  }
+  requestAnimationFrame(hostTick);
+}
+
+// Client send input periodically
+function clientSendInput(){
+  if(connToHost && connToHost.open){
+    const vx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    const vy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
+    connToHost.send({type:'input', vx:vx, vy:vy, ts:Date.now()});
+  }
+  setTimeout(clientSendInput, 60);
+}
+
+// Rendering
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // background grid
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.02)";
+  for(let x=0;x<canvas.width;x+=40){
+    ctx.fillRect(x,0,1,canvas.height);
+  }
+  for(let y=0;y<canvas.height;y+=40){
+    ctx.fillRect(0,y,canvas.width,1);
+  }
+  ctx.restore();
+
+  // draw players
+  for(const id in world.players){
+    const p = world.players[id];
+    // simple name label
+    ctx.beginPath();
+    ctx.fillStyle = p.color || '#6EE7B7';
+    ctx.arc(p.x, p.y, 14, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name || id.slice(0,6), p.x, p.y - 20);
+  }
+
+  // own local player (if host or client may have separate localPlayer)
+  if(isHost){
+    // host uses world.players[myPeerId]
+    const me = world.players[myPeerId];
+    if(me){
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(me.x, me.y, 20, 0, Math.PI*2);
+      ctx.stroke();
+    }
+  } else {
+    if(localPlayer && localPlayer.id){
+      // show local player if we have a slot
+      if(!world.players[localPlayer.id]){
+        // local simulated position (optimistic)
+        ctx.beginPath();
+        ctx.fillStyle = localPlayer.color || '#93C5FD';
+        ctx.arc(localPlayer.x, localPlayer.y, 14, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle='white';
+        ctx.fillText(localPlayer.name || 'you', localPlayer.x, localPlayer.y-20);
+      } else {
+        // highlight
+        const me = world.players[localPlayer.id];
+        ctx.strokeStyle = 'white'; ctx.lineWidth=2;
+        ctx.beginPath();
+        ctx.arc(me.x, me.y, 20, 0, Math.PI*2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  requestAnimationFrame(render);
+}
+
+// Input handling for clients: update local player optimistic position and send to host
+function setupInput(){
+  window.addEventListener('keydown', e => {
+    if(e.key === 'ArrowUp' || e.key === 'w') keys.up = true;
+    if(e.key === 'ArrowDown' || e.key === 's') keys.down = true;
+    if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+    if(e.key === 'ArrowRight' || e.key === 'd') keys.right = true;
+    if(e.code === 'Space'){
+      // respawn
+      if(isHost){
+        if(world.players[myPeerId]){
+          world.players[myPeerId].x = Math.random()*(canvas.width-80)+40;
+          world.players[myPeerId].y = Math.random()*(canvas.height-80)+40;
+          broadcastFullState();
+        }
+      } else {
+        if(connToHost && connToHost.open) connToHost.send({type:'respawn'});
+      }
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if(e.key === 'ArrowUp' || e.key === 'w') keys.up = false;
+    if(e.key === 'ArrowDown' || e.key === 's') keys.down = false;
+    if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+    if(e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+  });
+
+  // update local predicted position at 60Hz for responsive feel on client
+  setInterval(() => {
+    const vx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    const vy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
+    const speed = 200;
+    localPlayer.x += vx * speed * (1/60);
+    localPlayer.y += vy * speed * (1/60);
+    localPlayer.x = Math.max(16, Math.min(canvas.width-16, localPlayer.x));
+    localPlayer.y = Math.max(16, Math.min(canvas.height-16, localPlayer.y));
+  }, 1000/60);
+}
+
+// UI wiring
+createBtn.addEventListener('click', () => {
+  if(peer) peer.destroy();
+  isHost = true;
+  makePeer();
+  setStatus('Creating host...');
+  // Wait until peer open to set up host slot
+  peer.on('open', () => {
+    myPeerIdDiv.textContent = peer.id;
+    myPeerId = peer.id;
+    hostId = peer.id;
+    // Host puts itself into world.players as authoritative player
+    world.players[peer.id] = {
+      name: nameInput.value || ('Host-'+peer.id.slice(0,4)),
+      x: localPlayer.x,
+      y: localPlayer.y,
+      vx:0, vy:0,
+      color: localPlayer.color || rndColor(),
+      lastUpdate: Date.now()
+    };
+    setStatus('Host ready — share this ID with friends to join');
+    logConnections();
+    lastTick = performance.now();
+    requestAnimationFrame(hostTick);
+  });
+});
+
+joinBtn.addEventListener('click', () => {
+  if(!hostIdInput.value.trim()){
+    alert('Paste host Peer ID into the Host ID field');
+    return;
+  }
+  if(peer) peer.destroy();
+  isHost = false;
+  makePeer();
+  // must wait until peer open to connect to host
+  peer.on('open', () => {
+    localPlayer.id = peer.id;
+    localPlayer.name = nameInput.value || ('P-'+peer.id.slice(0,5));
+    localPlayer.color = localPlayer.color || rndColor();
+    connectToHost(hostIdInput.value.trim());
+    setStatus('Joining host: ' + hostIdInput.value.trim());
+  });
+});
+
+// copy id button
+copyIdBtn.addEventListener('click', async () => {
+  if(!myPeerId) { navigator.clipboard.writeText(''); return; }
+  try {
+    await navigator.clipboard.writeText(myPeerId);
+    setStatus('Peer ID copied to clipboard');
+  } catch(e){ setStatus('Copy failed'); }
+});
+
+// when host receives data from clients, their world.players update. Host also should accept local input
+// host local input controls its own player
+window.addEventListener('keydown', e => {
+  if(!isHost) return;
+  if(e.key === 'ArrowUp' || e.key === 'w') keys.up = true;
+  if(e.key === 'ArrowDown' || e.key === 's') keys.down = true;
+  if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+  if(e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+});
+window.addEventListener('keyup', e => {
+  if(!isHost) return;
+  if(e.key === 'ArrowUp' || e.key === 'w') keys.up = false;
+  if(e.key === 'ArrowDown' || e.key === 's') keys.down = false;
+  if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+  if(e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+});
+
+// Host should capture local vx/vy from keys and set world.players[myPeerId].vx/vy
+setInterval(() => {
+  if(isHost && myPeerId && world.players[myPeerId]){
+    const vx = (keys.right ? 1:0) - (keys.left?1:0);
+    const vy = (keys.down ? 1:0) - (keys.up?1:0);
+    world.players[myPeerId].vx = vx;
+    world.players[myPeerId].vy = vy;
+  }
+  // Client sends inputs to host
+  if(!isHost && connToHost && connToHost.open){
+    const vx = (keys.right ? 1:0) - (keys.left?1:0);
+    const vy = (keys.down ? 1:0) - (keys.up?1:0);
+    connToHost.send({type:'input', vx: vx, vy: vy, ts: Date.now()});
+  }
+}, 66);
+
+// automatic periodic attempts to create peer if not created
+if(!peer) makePeer();
+setupInput();
+render();
+clientSendInput();
+
+// Useful: resize canvas to fit container width
+function fitCanvas(){
+  const w = Math.min(1100, window.innerWidth - 120);
+  const h = Math.max(360, Math.min(700, window.innerHeight - 220));
+  canvas.width = w; canvas.height = h;
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+</script>
