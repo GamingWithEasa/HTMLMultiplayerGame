@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Neon Coin Chase Multiplayer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111827; touch-action: none; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        canvas { display: block; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 1rem; box-sizing: border-box; }
+        .hud-panel { background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(4px); padding: 10px 16px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); color: white; pointer-events: auto; }
+        .player-tag { font-weight: bold; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .color-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+        #leaderboard { max-height: 200px; overflow-y: auto; font-size: 14px; min-width: 150px; }
+        #status { font-size: 14px; opacity: 0.8; }
+        /* Scrollbar for leaderboard */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+    <!-- Game Canvas -->
+    <canvas id="gameCanvas"></canvas>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div class="hud-panel">
+                <h1 class="text-lg font-bold text-yellow-400">Neon Chase</h1>
+                <div id="status">Connecting...</div>
+                <div class="text-xs text-gray-400 mt-1">WASD / Arrows to move</div>
+            </div>
+            <div class="hud-panel" id="leaderboard">
+                <div class="text-xs text-gray-400 uppercase tracking-wider mb-2">Leaderboard</div>
+                <div id="scores-list">
+                    <!-- Scores injected here -->
+                </div>
+            </div>
+        </div>
+        
+        <!-- Mobile Controls Hint -->
+        <div class="text-center pb-4 opacity-50 text-white text-sm md:hidden pointer-events-none">
+            Tap & Drag to Move
+        </div>
+    </div>
+
+    <!-- Firebase & Game Logic -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, getDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuration ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        // --- Game Constants ---
+        const PLAYER_RADIUS = 15;
+        const COIN_RADIUS = 10;
+        const MOVE_SPEED = 5;
+        const SYNC_RATE = 50; // ms (limit write frequency)
+        const CLEANUP_THRESHOLD = 60000; // 1 minute inactivity
+
+        // --- State ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        let myId = null;
+        let myColor = '#ffffff';
+        let players = {}; // Local cache of all players
+        let coin = { x: -100, y: -100 }; // Default off-screen
+        let localPlayer = { x: window.innerWidth / 2, y: window.innerHeight / 2, score: 0, name: 'You' };
+        let keys = {};
+        let lastSyncTime = 0;
+        let isDragging = false;
+        let dragTarget = { x: 0, y: 0 };
+
+        // --- Setup & Auth ---
+        async function initGame() {
+            // Handle resize
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas();
+
+            // Auth
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth failed:", error);
+                document.getElementById('status').innerText = "Auth Error";
+                return;
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    myId = user.uid;
+                    myColor = generateRandomColor();
+                    localPlayer.name = `Player ${myId.substring(0, 4)}`;
+                    document.getElementById('status').innerText = `Online as ${localPlayer.name}`;
+                    
+                    // Join the game
+                    startFirestoreListeners();
+                    startGameLoop();
+                    
+                    // Initial spawn write
+                    writePlayerState();
+                }
+            });
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+
+        function generateRandomColor() {
+            const hue = Math.floor(Math.random() * 360);
+            return `hsl(${hue}, 70%, 60%)`;
+        }
+
+        // --- Firestore Logic ---
+
+        function getPlayersRef() {
+            return collection(db, 'artifacts', appId, 'public', 'data', 'players');
+        }
+
+        function getCoinRef() {
+            return doc(db, 'artifacts', appId, 'public', 'data', 'gamestate', 'coin');
+        }
+
+        function startFirestoreListeners() {
+            // Listen to Players
+            onSnapshot(getPlayersRef(), (snapshot) => {
+                snapshot.docChanges().forEach((change) => {
+                    const data = change.doc.data();
+                    const pid = change.doc.id;
+
+                    if (change.type === "added" || change.type === "modified") {
+                        // Update local cache (don't overwrite self position from server to avoid lag)
+                        if (pid !== myId) {
+                            players[pid] = data;
+                        } else {
+                            // Only sync score/color for self, keep local movement smooth
+                            localPlayer.score = data.score || 0;
+                            // If we haven't set color yet or server has different info
+                            if (!localPlayer.color) localPlayer.color = data.color; 
+                        }
+                    }
+                    if (change.type === "removed") {
+                        delete players[pid];
+                    }
+                });
+                updateLeaderboard();
+            }, (error) => console.error("Player sync error:", error));
+
+            // Listen to Coin
+            onSnapshot(getCoinRef(), (docSnap) => {
+                if (docSnap.exists()) {
+                    coin = docSnap.data();
+                } else {
+                    // If no coin exists, try to become the host and spawn one
+                    spawnCoin();
+                }
+            }, (error) => console.error("Coin sync error:", error));
+        }
+
+        function writePlayerState() {
+            if (!myId) return;
+            
+            const now = Date.now();
+            if (now - lastSyncTime < SYNC_RATE) return;
+
+            const ref = doc(getPlayersRef(), myId);
+            setDoc(ref, {
+                x: Math.round(localPlayer.x),
+                y: Math.round(localPlayer.y),
+                color: myColor,
+                score: localPlayer.score,
+                lastActive: now,
+                name: localPlayer.name
+            }, { merge: true }).catch(e => console.warn("Write failed", e));
+
+            lastSyncTime = now;
+        }
+
+        function spawnCoin() {
+            const newX = Math.floor(Math.random() * (canvas.width - 50)) + 25;
+            const newY = Math.floor(Math.random() * (canvas.height - 50)) + 25;
+            setDoc(getCoinRef(), { x: newX, y: newY }).catch(e => console.warn("Coin spawn failed", e));
+        }
+
+        async function claimCoin() {
+            // Optimistic update
+            localPlayer.score++;
+            
+            // Move coin immediately locally to prevent double claims (visual only)
+            coin.x = -100; 
+
+            // Database update
+            const playerRef = doc(getPlayersRef(), myId);
+            
+            // 1. Update Score
+            updateDoc(playerRef, { score: localPlayer.score });
+
+            // 2. Move Coin
+            spawnCoin();
+        }
+
+        // --- Cleanup Old Players ---
+        // Periodically check for stale players (ghosts)
+        setInterval(() => {
+            const now = Date.now();
+            Object.keys(players).forEach(pid => {
+                if (players[pid].lastActive && (now - players[pid].lastActive > CLEANUP_THRESHOLD)) {
+                    delete players[pid]; // Local delete
+                    // Optional: Could try to delete from Firestore if we wanted to be a "janitor"
+                }
+            });
+        }, 5000);
+
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', e => keys[e.key] = true);
+        window.addEventListener('keyup', e => keys[e.key] = false);
+
+        // Touch/Mouse for Mobile
+        window.addEventListener('mousedown', handleInputStart);
+        window.addEventListener('touchstart', handleInputStart, {passive: false});
+        window.addEventListener('mousemove', handleInputMove);
+        window.addEventListener('touchmove', handleInputMove, {passive: false});
+        window.addEventListener('mouseup', handleInputEnd);
+        window.addEventListener('touchend', handleInputEnd);
+
+        function handleInputStart(e) {
+            isDragging = true;
+            updateDragTarget(e);
+        }
+
+        function handleInputMove(e) {
+            if (isDragging) updateDragTarget(e);
+        }
+
+        function handleInputEnd() {
+            isDragging = false;
+        }
+
+        function updateDragTarget(e) {
+            e.preventDefault(); // Prevent scrolling
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            dragTarget = { x: clientX, y: clientY };
+        }
+
+        // --- Game Loop ---
+        function startGameLoop() {
+            requestAnimationFrame(update);
+        }
+
+        function update() {
+            moveLocalPlayer();
+            checkCollisions();
+            draw();
+            requestAnimationFrame(update);
+        }
+
+        function moveLocalPlayer() {
+            let dx = 0;
+            let dy = 0;
+
+            // Keyboard
+            if (keys['ArrowUp'] || keys['w']) dy -= 1;
+            if (keys['ArrowDown'] || keys['s']) dy += 1;
+            if (keys['ArrowLeft'] || keys['a']) dx -= 1;
+            if (keys['ArrowRight'] || keys['d']) dx += 1;
+
+            // Mouse/Touch
+            if (isDragging) {
+                const angle = Math.atan2(dragTarget.y - localPlayer.y, dragTarget.x - localPlayer.x);
+                const dist = Math.hypot(dragTarget.x - localPlayer.x, dragTarget.y - localPlayer.y);
+                
+                if (dist > 5) { // Deadzone
+                    dx = Math.cos(angle);
+                    dy = Math.sin(angle);
+                }
+            }
+
+            // Normalize vector
+            if (dx !== 0 || dy !== 0) {
+                // Normalize if using keyboard diagonal
+                if (!isDragging && dx !== 0 && dy !== 0) {
+                    const length = Math.hypot(dx, dy);
+                    dx /= length;
+                    dy /= length;
+                }
+
+                localPlayer.x += dx * MOVE_SPEED;
+                localPlayer.y += dy * MOVE_SPEED;
+
+                // Bounds
+                localPlayer.x = Math.max(PLAYER_RADIUS, Math.min(canvas.width - PLAYER_RADIUS, localPlayer.x));
+                localPlayer.y = Math.max(PLAYER_RADIUS, Math.min(canvas.height - PLAYER_RADIUS, localPlayer.y));
+
+                writePlayerState();
+            }
+        }
+
+        function checkCollisions() {
+            // Distance to coin
+            const dist = Math.hypot(localPlayer.x - coin.x, localPlayer.y - coin.y);
+            if (dist < PLAYER_RADIUS + COIN_RADIUS) {
+                claimCoin();
+            }
+        }
+
+        // --- Rendering ---
+        function draw() {
+            // Clear
+            ctx.fillStyle = '#111827';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw Grid (Visual flair)
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.lineWidth = 1;
+            const gridSize = 50;
+            for (let x = 0; x < canvas.width; x += gridSize) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+            }
+            for (let y = 0; y < canvas.height; y += gridSize) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+            }
+
+            // Draw Coin
+            if (coin.x > 0) {
+                ctx.save();
+                ctx.shadowColor = '#facc15';
+                ctx.shadowBlur = 20;
+                ctx.fillStyle = '#facc15';
+                ctx.beginPath();
+                ctx.arc(coin.x, coin.y, COIN_RADIUS, 0, Math.PI * 2);
+                ctx.fill();
+                // Shine effect
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.arc(coin.x - 3, coin.y - 3, 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            // Draw Other Players
+            Object.values(players).forEach(p => drawPlayer(p));
+
+            // Draw Self (Last to be on top)
+            drawPlayer({ ...localPlayer, color: myColor, isSelf: true });
+        }
+
+        function drawPlayer(p) {
+            if (!p.x || !p.y) return;
+            
+            ctx.save();
+            
+            // Glow
+            ctx.shadowColor = p.color;
+            ctx.shadowBlur = p.isSelf ? 20 : 10;
+
+            // Body
+            ctx.fillStyle = p.color;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, PLAYER_RADIUS, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Border for self
+            if (p.isSelf) {
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#fff';
+                ctx.stroke();
+            }
+
+            // Name Label
+            ctx.shadowBlur = 0; // Remove glow for text
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(p.score || 0, p.x, p.y + 5); // Score inside
+            
+            // Name above
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.font = '10px sans-serif';
+            ctx.fillText(p.name || 'Unknown', p.x, p.y - PLAYER_RADIUS - 8);
+
+            ctx.restore();
+        }
+
+        function updateLeaderboard() {
+            const list = document.getElementById('scores-list');
+            const allPlayers = Object.values(players).concat([{ ...localPlayer, color: myColor, name: localPlayer.name + " (You)" }]);
+            
+            // Sort by score desc
+            allPlayers.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+            let html = '';
+            allPlayers.forEach(p => {
+                html += `
+                    <div class="player-tag">
+                        <span class="color-dot" style="background-color: ${p.color}"></span>
+                        <span style="flex-grow:1">${p.name}</span>
+                        <span style="font-weight:bold">${p.score || 0}</span>
+                    </div>
+                `;
+            });
+            list.innerHTML = html;
+        }
+
+        // Start
+        initGame();
+
+    </script>
+</body>
+</html>
